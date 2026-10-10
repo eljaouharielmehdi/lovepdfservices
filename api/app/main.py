@@ -163,7 +163,7 @@ async def pdf_to_image(
 
 # ------------------------------------------------------------------ OCR
 async def _analyse(file: UploadFile, lang: str, dpi: float | None, vectorize: bool = True,
-                   deskew: bool = False):
+                   deskew: bool | str = False):
     data = await _read(file)
     pages = load_pages(data, dpi)
     return await analyse_all(pages, _langs(lang), vectorize=vectorize, deskew=deskew)
@@ -192,9 +192,12 @@ async def ocr_word(
     file: Annotated[UploadFile, File()],
     lang: Annotated[str, Form()] = DEFAULT_LANGS,
     dpi: Annotated[float | None, Form(ge=50, le=1200)] = None,
-    deskew: Annotated[bool, Form(description=DESKEW_HELP)] = False,
+    deskew: Annotated[Literal["auto", "true", "false"], Form(
+        description="auto (default): straighten pages tilted by 0.3 degree or more - a Word "
+                    "document cannot hold tilted text lines")] = "auto",
 ):
-    analysed = await _analyse(file, lang, dpi, deskew=deskew)
+    mode = {"auto": "auto", "true": True, "false": False}[deskew]
+    analysed = await _analyse(file, lang, dpi, deskew=mode)
     return _file(build_docx([from_ocr(a) for a in analysed]), f"{_stem(file.filename)}.docx", DOCX)
 
 

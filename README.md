@@ -73,6 +73,8 @@ curl -F file=@invoice.jpg http://localhost:8000/api/v1/ocr/word -o invoice.docx
 | | `lang` | `ara+eng` (models installed: `ara eng fra`, more via build arg) |
 | | `dpi` | override the scan resolution (default: from the file, else page = A4 wide) |
 | ocr/pdf | `background` | `vector` (default), `original`, `none` |
+| ocr/pdf, ocr/text, ocr/json | `deskew` | `false` (default, keeps the exact tilt), `true` |
+| ocr/word | `deskew` | `auto` (default: straighten when tilted ≥ 0.3°), `true`, `false` |
 
 ## How the OCR → PDF regeneration works
 
@@ -113,17 +115,47 @@ fonts are embedded.
 
 ## How PDF / OCR → Word keeps the look
 
-* Paragraphs are rebuilt from lines (by gap and pitch). Alignment and indentation are measured
-  against the text column, and each paragraph gets an **exact line pitch** placed so the first
-  baseline lands where it was. Word and LibreOffice both put the baseline at 0.8 × the line
-  height.
-* Arabic paragraphs get `w:bidi` and Arabic runs `w:rtl`, `w:cs` fonts and `szCs`. Mixed lines are
-  written in logical order. Note that in a bidi paragraph Word reads `jc="right"` as the *end*
-  (left) side, and the writer accounts for that.
-* Ruled tables become real Word tables: column widths, row heights, merged cells, borders,
-  cell shading, and right-to-left column order (`w:bidiVisual`).
-* All non-text graphics (bands, logos, photos) are placed on a page-sized picture anchored behind
-  the text, so the page looks like the original while all text stays editable.
+The Word file is rebuilt natively. Everything is real, editable Word content except logos,
+photos and signatures:
+
+| Original | In the .docx |
+|---|---|
+| text | real paragraphs and runs: font, size, bold, color, RTL (`w:bidi` / `w:rtl`) |
+| ruled tables | real Word tables: column widths, row heights, merged cells, borders, shading, RTL column order |
+| label/value lines, unruled tables, columns | one paragraph per line with **tab stops** at the original positions |
+| colored bands, filled boxes, standalone rules, page color | native Word **shapes** (DrawingML rectangles) at the exact page position |
+| logos, photos, signatures, stamps, other complex drawings | **pictures**, each cut out and anchored at its exact original position and size |
+
+How it is made to look exactly like the original:
+
+* **Vertical position.** Every paragraph gets an exact line pitch, placed so that its first
+  baseline lands where it was. Word and LibreOffice both put the baseline at 0.8 × the line height.
+* **Horizontal position.** Every word gets its own character scale (`w:w`), so it is exactly
+  as wide as in the original, measured in the font Word will use. Every space gets the
+  spacing or scale that reproduces the original gap. That is exact even where the original font
+  is not available, and the text is still normal, editable text.
+* **Arabic.** Latin words and numbers inside right-to-left text are wrapped in invisible
+  left-to-right marks. Their visual order (for example `117-2025` in an Arabic line) is then
+  shown exactly as in the original by every renderer. Note that in a bidi paragraph Word reads
+  `jc="right"` as the *end* (left) side, and the writer accounts for that.
+* **Tables.** The table indent compensates for the cell margin and the border width, and RTL
+  tables are measured from the right margin.
+* **Scans.** Tilted scans are straightened automatically for Word (`deskew=auto`), since a
+  Word document cannot hold tilted text lines. This also lets a tilted table become a real table.
+* **Word compatibility.** All property elements are written in OOXML schema order, so
+  Microsoft Word opens the files without "unreadable content" repairs.
+
+Measured on the test documents, with the .docx rendered back by LibreOffice and compared with
+the original (share of ink within 2 px):
+
+| Input | Precision / recall |
+|---|---|
+| digital Arabic invoice with band, logo, table, photo, signature | 1.000 / 1.000 |
+| digital Arabic letter | 1.000 / 1.000 |
+| digital Arabic form (tab stops) | 0.999 / 0.999 |
+| scanned invoice (OCR) | 0.998 / 1.000 |
+| scanned letter (OCR, original font not available) | 0.986 / 0.983 |
+| tilted noisy phone photo (OCR, straightened) | 0.998 / 0.999 |
 
 ## Tests
 
@@ -172,6 +204,8 @@ the original on the left and the regenerated output on the right:
 * `ocr_letter_original_vs_regenerated.png`: OCR → PDF of an Arabic / English letter with a table
 * `ocr_phone_photo_original_vs_regenerated.png`: a tilted, noisy, JPEG-compressed phone capture
 * `ocr_to_word_original_vs_docx.png`, `ocr_invoice.docx`: OCR → editable Word
+* `pdf_to_word_invoice_original_vs_docx.png`, `pdf_to_word_invoice.docx`: digital PDF with graphics → Word
+* `pdf_to_word_form.docx`: a form with tab-positioned fields
 * `pdf_to_word_arabic.docx`, `word_to_pdf_arabic.pdf`: Word ⇄ PDF
 
 ## Known limits

@@ -169,6 +169,9 @@ async def office_to_pdf(filename: str, data: bytes, pdfa: str | None = None,
 
 
 def _page_is_scanned(page: pymupdf.Page) -> bool:
+    # one image covering the page (a scan, possibly with an invisible OCR layer)
+    if scan_dpi(page):
+        return True
     text = page.get_text("text").strip()
     if len(text) >= 20:
         return False
@@ -198,6 +201,6 @@ async def pdf_to_docx(pdf: bytes, mode: str = "auto", langs: str = "ara+eng", dp
             pix = p.get_pixmap(dpi=rdpi, colorspace=pymupdf.csRGB, alpha=False)
             arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3).copy()
             ocr_imgs.append(PageImage(arr, rdpi))
-    analysed = iter(await analyse_all(ocr_imgs, langs) if ocr_imgs else [])
+    analysed = iter(await analyse_all(ocr_imgs, langs, deskew="auto") if ocr_imgs else [])
     pages = [from_ocr(next(analysed)) if use_ocr else from_pdf_page(p) for p, use_ocr in zip(doc, plan)]
     return build_docx(pages)

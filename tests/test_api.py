@@ -40,7 +40,54 @@ def docx_text(data: bytes) -> str:
         for row in t.rows:
             for c in row.cells:
                 parts.append(c.text)
-    return "\n".join(parts)
+    # invisible left-to-right marks keep Latin / numbers in their visual order
+    return "\n".join(parts).replace("\u200e", "")
+
+
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def docx_structure(data: bytes) -> dict:
+    """Native content of a .docx: shapes, anchored pictures (position / size in pt),
+    tables, tab stops, and Word schema-order problems."""
+    import re
+    import zipfile
+
+    xml = zipfile.ZipFile(io.BytesIO(data)).read("word/document.xml").decode()
+    pics = []
+    for m in re.finditer(r"<wp:anchor.*?</wp:anchor>", xml, re.S):
+        a = m.group(0)
+        if "<pic:pic" not in a:
+            continue
+        x, y = (int(v) / 12700 for v in re.findall(r"<wp:posOffset>(-?\d+)</wp:posOffset>", a)[:2])
+        cx, cy = (int(v) / 12700 for v in re.search(r'<wp:extent cx="(\d+)" cy="(\d+)"', a).groups())
+        pics.append((x, y, cx, cy))
+    problems = []
+    d = Document(io.BytesIO(data))
+    order = {"tcPr": ["tcW", "gridSpan", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "vAlign"],
+             "tblPr": ["tblStyle", "bidiVisual", "tblW", "jc", "tblInd", "tblBorders", "tblLayout",
+                       "tblCellMar", "tblLook"]}
+    for name, seq in order.items():
+        for el in d.element.body.iter(W_NS + name):
+            tags = [c.tag.replace(W_NS, "") for c in el]
+            if len(tags) != len(set(tags)):
+                problems.append(f"duplicate in {name}: {tags}")
+            known = [t for t in tags if t in seq]
+            if known != sorted(known, key=seq.index):
+                problems.append(f"order in {name}: {tags}")
+    return {"shapes": xml.count("<wps:wsp>"), "pictures": pics, "tables": xml.count("<w:tbl>"),
+            "tabs": xml.count("<w:tab "), "problems": problems}
+
+
+def docx_looks_like(api, docx: bytes, reference: np.ndarray, dpi: float, out_png=None) -> dict:
+    """Render the .docx with the service (LibreOffice in Gotenberg) and compare it
+    pixel-wise with the reference page."""
+    pdf = post(api, "/api/v1/word-to-pdf", {"file": ("x.docx", docx)}).content
+    assert pymupdf.open(stream=pdf, filetype="pdf").page_count == 1
+    got = render(pdf, dpi)
+    if out_png:
+        save_side_by_side(reference, got, out_png)
+    return visual_match(reference, got, tol=2)
 
 
 def docx_baseline_error(api, docx: bytes, reference_pdf: bytes) -> tuple[float, float]:
@@ -115,9 +162,13 @@ def test_pdf_to_word_arabic(api, sample_pdf, truth, out_dir):
     assert "<w:bidiVisual/>" in t._tbl.xml
     assert [c.text for c in t.rows[0].cells] == ["الاسم", "الكمية", "السعر"]
     assert [c.text for c in t.rows[2].cells] == ["دفتر", "2", "40"]
-    # layout: every line baseline lands where it was in the PDF
+    # layout: every line baseline lands where it was in the PDF, and it looks the same
     worst, mean = docx_baseline_error(api, r.content, sample_pdf)
-    assert worst < 2.0 and mean < 1.0, (worst, mean)
+    assert worst < 1.0 and mean < 0.5, (worst, mean)
+    st = docx_structure(r.content)
+    assert not st["problems"] and st["pictures"] == [] and st["shapes"] == 0, st
+    m = docx_looks_like(api, r.content, render(sample_pdf, 150), 150, out_dir / "pdf_to_word_compare.png")
+    assert m["precision"] > 0.98 and m["recall"] > 0.98, m
 
 
 # ===================================================================== image -> pdf
@@ -238,16 +289,22 @@ def test_ocr_to_word(api, truth, out_dir):
     assert [c.text for c in t.rows[0].cells] == ["المنتج", "الكمية", "السعر"]
     assert [c.text for c in t.rows[1].cells] == ["حاسوب محمول", "2", "8500"]
     assert "<w:bidiVisual/>" in t._tbl.xml
-    # header cells keep their shading, the band / logo are on the page background
+    # header cells keep their shading
     assert 'w:fill="CF' in t._tbl.xml or 'w:fill="D0' in t._tbl.xml
-    assert "behindDoc=\"1\"" in d.element.xml
+    st = docx_structure(r.content)
+    assert not st["problems"], st["problems"]
+    # band as a native shape, the logo as the only picture, exactly where it was
+    assert st["shapes"] >= 1
+    assert len(st["pictures"]) == 1, st["pictures"]
+    x, y, w, h = st["pictures"][0]
+    k = 72 / 200
+    lx0, ly0, lx1, ly1 = 99 * k, 58 * k, 312 * k, 271 * k     # logo ink box in the scan
+    assert x <= lx0 + 1 and y <= ly0 + 1 and x + w >= lx1 - 1 and y + h >= ly1 - 1
+    assert w < (lx1 - lx0) + 6 and h < (ly1 - ly0) + 6
     # rendered back, it looks like the scan
-    pdf = post(api, "/api/v1/word-to-pdf", {"file": ("x.docx", r.content)}).content
     orig = np.asarray(Image.open(io.BytesIO(src)).convert("RGB"))
-    regen = render(pdf, 200)
-    save_side_by_side(orig, regen, out_dir / "ocr_word_compare.png")
-    m = visual_match(orig, regen, tol=4)
-    assert m["precision"] > 0.85 and m["recall"] > 0.85, m
+    m = docx_looks_like(api, r.content, orig, 200, out_dir / "ocr_word_compare.png")
+    assert m["precision"] > 0.98 and m["recall"] > 0.98, m
 
 
 def test_ocr_text_and_json(api, truth):
@@ -295,3 +352,58 @@ def test_ocr_phone_capture(api, out_dir):
             save_side_by_side(orig, regen, out_dir / "ocr_phone_compare.png")
             m = visual_match(orig, regen, tol=3)
             assert m["precision"] > 0.9 and m["recall"] > 0.9, m
+
+
+# ===================================================================== native Word graphics
+def test_pdf_to_word_graphics_are_native(api, out_dir):
+    """Digital PDF with a vector band, a vector logo, a table, a photo and a drawn
+    signature: band -> native shape, table -> native table, logo / photo / signature
+    -> pictures at their exact place, all text editable."""
+    src = (FIX / "invoice_ar.pdf").read_bytes()
+    r = post(api, "/api/v1/pdf-to-word", {"file": ("invoice_ar.pdf", src)})
+    (out_dir / "pdf_to_word_invoice.docx").write_bytes(r.content)
+    st = docx_structure(r.content)
+    assert not st["problems"], st["problems"]
+    assert st["tables"] == 1 and st["shapes"] >= 1
+    assert len(st["pictures"]) == 3, st["pictures"]
+    page = pymupdf.open(stream=src, filetype="pdf")[0]
+    photo = pymupdf.Rect(page.get_image_info()[0]["bbox"])
+    assert any(abs(x - photo.x0) < 1 and abs(y - photo.y0) < 1 and abs(w - photo.width) < 1
+               and abs(h - photo.height) < 1 for x, y, w, h in st["pictures"]), st["pictures"]
+    # nothing is a page-sized picture
+    assert all(w * h < 0.2 * page.rect.width * page.rect.height for _, _, w, h in st["pictures"])
+    text = docx_text(r.content)
+    for phrase in ["فاتورة ضريبية", "اسم العميل: شركة النور للتجارة", "المجموع الكلي: 19750 درهم",
+                   "التوقيع", "Thank you for your business. Invoice No. 2025-0042"]:
+        assert phrase in text, phrase
+    m = docx_looks_like(api, r.content, render(src, 150), 150, out_dir / "pdf_to_word_invoice_compare.png")
+    assert m["precision"] > 0.98 and m["recall"] > 0.98, m
+
+
+def test_pdf_to_word_form_uses_tab_stops(api, out_dir):
+    """Label / value pairs spread over a line and an unruled table keep their exact
+    horizontal positions with native tab stops (Arabic numbers keep their order)."""
+    src = (FIX / "form_ar.pdf").read_bytes()
+    r = post(api, "/api/v1/pdf-to-word", {"file": ("form_ar.pdf", src)})
+    (out_dir / "pdf_to_word_form.docx").write_bytes(r.content)
+    st = docx_structure(r.content)
+    assert not st["problems"] and st["tabs"] >= 6 and st["pictures"] == [], st
+    text = docx_text(r.content)
+    for phrase in ["الاسم: أحمد بن علي", "رقم الملف:", "Reference: AB-77", "استشارة قانونية", "1200"]:
+        assert phrase in text, phrase
+    m = docx_looks_like(api, r.content, render(src, 150), 150, out_dir / "pdf_to_word_form_compare.png")
+    assert m["precision"] > 0.98 and m["recall"] > 0.98, m
+
+
+def test_ocr_to_word_phone_capture(api, out_dir):
+    """Tilted noisy photo: straightened automatically for Word, table rebuilt natively."""
+    src = (FIX / "phone_invoice.jpg").read_bytes()
+    r = post(api, "/api/v1/ocr/word", {"file": ("phone.jpg", src)})
+    (out_dir / "ocr_phone.docx").write_bytes(r.content)
+    st = docx_structure(r.content)
+    assert not st["problems"] and st["tables"] == 1, st
+    d = Document(io.BytesIO(r.content))
+    t = d.tables[0]
+    assert [c.text for c in t.rows[0].cells] == ["المنتج", "الكمية", "السعر"]
+    text = docx_text(r.content)
+    assert "المجموع الكلي: 19750 درهم" in text

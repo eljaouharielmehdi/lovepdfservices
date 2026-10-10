@@ -21,9 +21,9 @@ from docx.enum.section import WD_SECTION
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Emu, Pt
-from PIL import Image, ImageDraw
 
-from .docmodel import DLine, DPage, DWord, logical_order
+from .docmodel import (DLine, DPage, DWord, line_is_rtl, logical_order, needs_space,
+                       space_advance, word_metrics)
 from .textutil import has_arabic, is_rtl_text
 
 EMU_PER_PT = 12700
@@ -145,7 +145,7 @@ def _hex(c) -> str:
     return "%02X%02X%02X" % tuple(int(v) for v in c[:3])
 
 
-def _set_run_props(run, w: DWord, rtl: bool) -> None:
+def _set_run_props(run, w: DWord, rtl: bool, spacing: float = 0.0) -> None:
     rpr = run._r.get_or_add_rPr()
     rpr.append(_el("w:rFonts", **{"w:ascii": w.font, "w:hAnsi": w.font, "w:cs": w.font,
                                   "w:eastAsia": w.font}))
@@ -157,6 +157,12 @@ def _set_run_props(run, w: DWord, rtl: bool) -> None:
         rpr.append(_el("w:iCs"))
     if tuple(w.color) != (0, 0, 0):
         rpr.append(_el("w:color", **{"w:val": _hex(w.color)}))
+    if abs(spacing) >= 0.05:
+        rpr.append(_el("w:spacing", **{"w:val": int(round(spacing * TW))}))
+    pct = _scale_pct(w)
+    if pct != 100:
+        # character scaling: the run is exactly as wide as in the original
+        rpr.append(_el("w:w", **{"w:val": max(1, min(600, pct))}))
     half = max(2, int(round(w.size * 2)))
     rpr.append(_el("w:sz", **{"w:val": half}))
     rpr.append(_el("w:szCs", **{"w:val": half}))
@@ -165,28 +171,122 @@ def _set_run_props(run, w: DWord, rtl: bool) -> None:
         rpr.append(_el("w:lang", **{"w:bidi": "ar-SA"}))
 
 
+def _scale_pct(w: DWord) -> int:
+    return int(round(w.scale * 100))
+
+
 def _style_key(w: DWord):
-    return (w.bold, w.italic, tuple(w.color), round(w.size * 2), w.font, has_arabic(w.text))
+    return (w.bold, w.italic, tuple(w.color), round(w.size * 2), w.font, has_arabic(w.text),
+            _scale_pct(w))
 
 
-_CLOSE = set(".,:;!?\u060c\u061b\u061f)]}\u00bb%")
-_OPEN = set("([{\u00ab")
+LRM = "\u200e"
 
 
-def _join(words: list[DWord], leading: bool) -> str:
+def _visual(w: DWord, rtl_para: bool) -> str:
+    """In a right-to-left paragraph, Latin words and numbers are wrapped in
+    left-to-right marks: the PDF / scan gives their *visual* order, and the marks
+    make every Word renderer show exactly that order (Arabic-context numbers such
+    as 117-2025 would otherwise be re-ordered by the bidi algorithm)."""
+    if rtl_para and not has_arabic(w.text) and any(c.isalnum() for c in w.text):
+        return LRM + w.text + LRM
+    return w.text
+
+
+def _join(words: list[DWord], leading: bool, rtl_para: bool = False) -> str:
     out = ""
     prev = None
     for w in words:
         if prev is not None or leading:
-            glue = not (w.text and all(c in _CLOSE for c in w.text)) and not (
-                prev is not None and prev.text and all(c in _OPEN for c in prev.text))
-            out += " " if glue else ""
-        out += w.text
+            out += " " if needs_space(prev, w) else ""
+        out += _visual(w, rtl_para)
         prev = w
     return out
 
 
-def _add_runs(par, words: list[DWord]) -> None:
+def _dir_class(w: DWord, rtl_para: bool) -> bool:
+    """True when the word is laid out right-to-left inside a paragraph of the
+    given direction (Latin words / numbers in an RTL paragraph are LTR islands)."""
+    if not rtl_para:
+        return has_arabic(w.text)
+    return has_arabic(w.text) or not any(c.isalnum() for c in w.text)
+
+
+def _line_runs(par, words: list[DWord], rtl_para: bool, leading: bool = False) -> None:
+    """Write one line so every word keeps its original width (character scale) and
+    every gap its original width (character spacing on the space), measured in the
+    font Word uses. Words are given in logical order."""
+    if not words:
+        return
+    mets = [word_metrics(w, rtl_para or has_arabic(w.text)) for w in words]
+    if any(m is None for m in mets):
+        _add_runs(par, words, rtl_para)
+        return
+    scales = []
+    for w, (adv, lb, rb, ink) in zip(words, mets):
+        target = w.bbox[2] - w.bbox[0]
+        natural = ink if w.ink_box else adv
+        scales.append(float(np.clip(target / max(0.1, natural), 0.6, 1.6)))
+    dirs = [_dir_class(w, rtl_para) for w in words]
+    # blocks: maximal runs of words laid out against the paragraph direction
+    block_of = list(range(len(words)))
+    for i in range(1, len(words)):
+        if dirs[i] != rtl_para and dirs[i - 1] != rtl_para:
+            block_of[i] = block_of[i - 1]
+
+    def block(i):
+        return [j for j in range(len(words)) if block_of[j] == block_of[i] and dirs[j] != rtl_para] or [i]
+
+    def bear(i, side):  # visual bearing (pt) of word i on its left / right side
+        if not words[i].ink_box:
+            return 0.0
+        adv, lb, rb, ink = mets[i]
+        return (lb if side == "left" else rb) * scales[i]
+
+    def gap_spec(a, b):
+        """(gap between the facing ink edges in the original, bearings of those edges)."""
+        wa, wb = words[a], words[b]
+        a_in = dirs[a] != rtl_para
+        b_in = dirs[b] != rtl_para
+        if a_in and b_in and block_of[a] == block_of[b] or (not a_in and not b_in):
+            # same direction: a precedes b along that direction
+            if dirs[a]:   # right-to-left: a is right of b
+                return wa.bbox[0] - wb.bbox[2], bear(a, "left") + bear(b, "right")
+            return wb.bbox[0] - wa.bbox[2], bear(a, "right") + bear(b, "left")
+        if b_in:      # entering an island: the space touches the island's near edge
+            blk = block(b)
+            if rtl_para:
+                near = max(blk, key=lambda j: words[j].bbox[2])
+                return wa.bbox[0] - words[near].bbox[2], bear(a, "left") + bear(near, "right")
+            near = min(blk, key=lambda j: words[j].bbox[0])
+            return words[near].bbox[0] - wa.bbox[2], bear(a, "right") + bear(near, "left")
+        blk = block(a)  # leaving an island
+        if rtl_para:
+            far = min(blk, key=lambda j: words[j].bbox[0])
+            return words[far].bbox[0] - wb.bbox[2], bear(far, "left") + bear(b, "right")
+        far = max(blk, key=lambda j: words[j].bbox[2])
+        return wb.bbox[0] - words[far].bbox[2], bear(far, "right") + bear(b, "left")
+
+    if leading:
+        run = par.add_run(" ")
+        _set_run_props(run, words[0], False)
+    for i, w in enumerate(words):
+        if i and needs_space(words[i - 1], w):
+            gap, bearings = gap_spec(i - 1, i)
+            sp = space_advance(words[i - 1])
+            extra = float(np.clip(gap - bearings - sp, -0.95 * sp, 6 * w.size))
+            # wider gap: character spacing on the space; narrower gap: a horizontally
+            # scaled space (renderers ignore negative spacing on a space)
+            sw = copy.copy(words[i - 1])
+            sw.scale = 1.0 if extra >= 0 else max(0.05, (sp + extra) / sp)
+            run = par.add_run(" ")
+            _set_run_props(run, sw, has_arabic(words[i - 1].text), spacing=max(0.0, extra))
+        w.scale = scales[i]
+        run = par.add_run(_visual(w, rtl_para))
+        _set_run_props(run, w, has_arabic(w.text))
+
+
+def _add_runs(par, words: list[DWord], rtl_para: bool = False) -> None:
     groups: list[list[DWord]] = []
     for w in words:
         if groups and _style_key(groups[-1][-1]) == _style_key(w):
@@ -194,18 +294,26 @@ def _add_runs(par, words: list[DWord]) -> None:
         else:
             groups.append([w])
     for gi, g in enumerate(groups):
-        text = _join(g, leading=gi > 0)
+        text = _join(g, leading=gi > 0, rtl_para=rtl_para)
         run = par.add_run(text)
         _set_run_props(run, g[0], has_arabic(text))
 
 
 def _para_props(par, *, rtl: bool, align: str | None, before: float = 0, after: float = 0,
-                line: float | None = None, ind_start: float = 0, ind_end: float = 0) -> None:
+                line: float | None = None, ind_start: float = 0, ind_end: float = 0,
+                tabs: list[float] | None = None) -> None:
     ppr = par._p.get_or_add_pPr()
     for tag in ("w:bidi", "w:spacing", "w:ind", "w:jc"):
         for old in ppr.findall(qn(tag)):
             ppr.remove(old)
     ppr.append(_el("w:widowControl", **{"w:val": "0"}))
+    if tabs:
+        # "left" == start in both directions; positions are measured from the start
+        # margin (the right one in a right-to-left paragraph)
+        t = _el("w:tabs")
+        for pos in sorted(tabs):
+            t.append(_el("w:tab", **{"w:val": "left", "w:pos": int(round(pos * TW))}))
+        ppr.append(t)
     if rtl:
         ppr.append(_el("w:bidi"))
     sp = {"w:before": int(max(0, before) * TW), "w:after": int(max(0, after) * TW)}
@@ -220,6 +328,22 @@ def _para_props(par, *, rtl: bool, align: str | None, before: float = 0, after: 
 
 
 # =============================================================== paragraphs
+def segments(ln: DLine) -> list[list[DWord]]:
+    """Split a line at wide horizontal gaps (unruled tables, forms, columns).
+    Segments are returned in reading order, words inside in logical order."""
+    ws = sorted(ln.words, key=lambda w: w.bbox[0])
+    gap_min = 1.5 * ln.size
+    segs: list[list[DWord]] = [[ws[0]]]
+    for w in ws[1:]:
+        if w.bbox[0] - segs[-1][-1].bbox[2] > gap_min:
+            segs.append([w])
+        else:
+            segs[-1].append(w)
+    if ln.rtl:
+        segs.reverse()
+    return [logical_order(sg, ln.rtl) for sg in segs]
+
+
 @dataclass
 class Para:
     lines: list[DLine]
@@ -238,7 +362,11 @@ def group_paragraphs(lines: list[DLine]) -> list[Para]:
     lines = sorted(lines, key=lambda ln: (ln.bbox[1], ln.bbox[0]))
     paras: list[Para] = []
     for ln in lines:
-        if paras:
+        if len(segments(ln)) > 1:          # tab-positioned line: its own paragraph
+            paras.append(Para([ln]))
+            paras[-1].tabbed = True
+            continue
+        if paras and not getattr(paras[-1], "tabbed", False):
             p = paras[-1]
             last = p.lines[-1]
             lb, cb = last.bbox, ln.bbox
@@ -294,14 +422,14 @@ def _alignment(p: Para, col0: float, col1: float) -> tuple[str | None, float, fl
 
 # =============================================================== pictures
 def _anchor_picture(par, png: bytes, x_pt: float, y_pt: float, w_pt: float, h_pt: float,
-                    behind: bool = True) -> None:
+                    z: int = 0, behind: bool = True) -> None:
     run = par.add_run()
     run.add_picture(io.BytesIO(png), width=Emu(int(w_pt * EMU_PER_PT)),
                     height=Emu(int(h_pt * EMU_PER_PT)))
     inline = run._r.find(".//" + qn("wp:inline"))
     cx, cy = inline.find(qn("wp:extent")).get("cx"), inline.find(qn("wp:extent")).get("cy")
-    anchor = _el("wp:anchor", distT=0, distB=0, distL=0, distR=0, simplePos=0, relativeHeight=0,
-                 behindDoc=1 if behind else 0, locked=1, layoutInCell=1, allowOverlap=1)
+    anchor = _el("wp:anchor", distT=0, distB=0, distL=0, distR=0, simplePos=0, relativeHeight=z,
+                 behindDoc=1 if behind else 0, locked=0, layoutInCell=1, allowOverlap=1)
     anchor.append(_el("wp:simplePos", x=0, y=0))
     ph = _el("wp:positionH", relativeFrom="page")
     po = OxmlElement("wp:posOffset")
@@ -323,35 +451,77 @@ def _anchor_picture(par, png: bytes, x_pt: float, y_pt: float, w_pt: float, h_pt
     inline.getparent().replace(inline, anchor)
 
 
-def _page_color(img: Image.Image) -> tuple[int, int, int]:
-    a = np.asarray(img.convert("RGB"))[::6, ::6].reshape(-1, 3)
-    q = (a // 16).astype(np.int32)
-    keys = q[:, 0] * 256 + q[:, 1] * 16 + q[:, 2]
-    vals, counts = np.unique(keys, return_counts=True)
-    sel = a[keys == vals[counts.argmax()]]
-    return tuple(int(v) for v in np.median(sel, axis=0))  # type: ignore[return-value]
+_SHAPE = (
+    '<w:drawing {ns}><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" '
+    'relativeHeight="{z}" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">'
+    '<wp:simplePos x="0" y="0"/>'
+    '<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>'
+    '<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
+    '<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>'
+    '<wp:docPr id="{sid}" name="{name} {sid}"/><wp:cNvGraphicFramePr/>'
+    '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+    '<wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="{fill}"/></a:solidFill>'
+    '<a:ln><a:noFill/></a:ln></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic>'
+    '</wp:anchor></w:drawing>')
+_SHAPE_NS = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+             'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+             'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+             'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"')
 
 
-def _background_png(page: DPage, tables: list[Table]) -> tuple[bytes | None, tuple[int, int, int]]:
-    if page.background is None:
-        return None, (255, 255, 255)
-    img = page.background.convert("RGB").copy()
-    pc = _page_color(img)
-    d = ImageDraw.Draw(img)
-    s = page.bg_scale
-    for t in tables:   # tables are rebuilt natively
-        x0, y0, x1, y1 = t.bbox
-        d.rectangle([(x0 - 3) * s, (y0 - 3) * s, (x1 + 3) * s, (y1 + 3) * s], fill=pc)
-    a = np.asarray(img).astype(np.int16)
-    if (np.abs(a - np.array(pc)).max(axis=-1) > 40).mean() < 0.0005:
-        return None, pc   # nothing but blank paper
-    # keep the file small: 150 dpi is plenty for backgrounds
-    target = 150 / 72
-    if s > target:
-        img = img.resize((int(img.width * target / s), int(img.height * target / s)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=True)
-    return buf.getvalue(), pc
+class _Ids:
+    """Unique docPr ids for shapes (pictures get theirs from python-docx)."""
+    def __init__(self) -> None:
+        self.n = 10000
+
+    def __call__(self) -> int:
+        self.n += 1
+        return self.n
+
+
+def _anchor_shape(par, ids: _Ids, x: float, y: float, w: float, h: float, color, z: int,
+                  name: str = "Box") -> None:
+    """Native Word rectangle (DrawingML), positioned on the page, behind the text."""
+    from docx.oxml import parse_xml
+
+    e = EMU_PER_PT
+    xml = _SHAPE.format(ns=_SHAPE_NS, z=z, x=int(round(x * e)), y=int(round(y * e)),
+                        cx=max(1, int(round(w * e))), cy=max(1, int(round(h * e))),
+                        sid=ids(), name=name, fill=_hex(color))
+    par.add_run()._r.append(parse_xml(xml))
+
+
+def _near(c1, c2, tol: int = 10) -> bool:
+    return max(abs(int(a) - int(b)) for a, b in zip(c1[:3], c2[:3])) <= tol
+
+
+def _place_graphics(par, page: DPage, tables: list[Table], ids: _Ids) -> None:
+    """Page colour, boxes and rules as native shapes, then pictures, at their exact
+    page positions, all behind the text, in the original stacking order."""
+    z = 1
+    if not _near(page.page_color, (255, 255, 255), 3):
+        _anchor_shape(par, ids, 0, 0, page.width, page.height, page.page_color, z, "Page")
+        z += 1
+
+    def in_table(r) -> bool:
+        for t in tables:
+            x0, y0, x1, y1 = t.bbox
+            if r.x >= x0 - 3 and r.y >= y0 - 3 and r.x + r.w <= x1 + 3 and r.y + r.h <= y1 + 3:
+                return True
+        return False
+
+    page_area = page.width * page.height
+    shapes = [r for r in page.rects if not in_table(r) and r.w > 0.1 and r.h > 0.1
+              and not (_near(r.color, page.page_color, 3) and r.w * r.h > 0.3 * page_area)]
+    # big boxes first so smaller boxes / rules stack on top (as drawn originally)
+    for r in sorted(shapes, key=lambda r: -(r.w * r.h)):
+        thin = min(r.w, r.h) <= 3.5
+        _anchor_shape(par, ids, r.x, r.y, r.w, r.h, r.color, z, "Line" if thin else "Box")
+        z += 1
+    for pic in page.pictures:
+        _anchor_picture(par, pic.png, pic.x, pic.y, pic.w, pic.h, z=z)
+        z += 1
 
 
 # =============================================================== tables -> docx
@@ -369,12 +539,24 @@ def _cell_paragraphs(words: list[DWord]) -> list[DLine]:
             rows.append([w])
     out = []
     for r in rows:
-        rtl = any(has_arabic(w.text) for w in r)
+        rtl = line_is_rtl(r)
         out.append(DLine(logical_order(r, rtl), rtl))
     return out
 
 
-def _write_table(doc, t: Table, margin_left: float, page_color) -> None:
+def _border(t: Table) -> tuple[float, tuple[int, int, int]]:
+    segs = t.hsegs + t.vsegs
+    if not segs:
+        return 0.75, (0, 0, 0)
+    bw = float(np.median([s.width for s in segs]))
+    bc = tuple(int(np.median([s.color[i] for s in segs])) for i in range(3))
+    return bw, bc  # type: ignore[return-value]
+
+
+CELL_MARGIN = 2.0  # pt, left / right cell padding
+
+
+def _write_table(doc, t: Table, margin_left: float, margin_right_edge: float, page_color) -> None:
     nr, nc = len(t.ys) - 1, len(t.xs) - 1
     all_words = [w for ws in t.cells.values() for w in ws]
     rtl = sum(has_arabic(w.text) for w in all_words) * 2 > max(1, len(all_words))
@@ -388,11 +570,11 @@ def _write_table(doc, t: Table, margin_left: float, page_color) -> None:
     tblpr.append(_el("w:tblW", **{"w:w": int(width * TW), "w:type": "dxa"}))
     if rtl:
         tblpr.append(_el("w:bidiVisual"))
-    tblpr.append(_el("w:tblInd", **{"w:w": int(max(0, t.xs[0] - margin_left) * TW), "w:type": "dxa"}))
-    widths = [s.width for s in t.hsegs + t.vsegs]
-    colors = [s.color for s in t.hsegs + t.vsegs]
-    bw = float(np.median(widths)) if widths else 0.75
-    bc = tuple(int(np.median([c[i] for c in colors])) for i in range(3)) if colors else (0, 0, 0)
+    # the indent positions the cell *text*, so the border sits one cell margin
+    # further out; in a right-to-left table it is measured from the right margin
+    ind = (margin_right_edge - t.xs[-1]) if rtl else (t.xs[0] - margin_left)
+    tblpr.append(_el("w:tblInd", **{"w:w": int(round((ind + CELL_MARGIN) * TW)), "w:type": "dxa"}))
+    bw, bc = _border(t)
     borders = _el("w:tblBorders")
     for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         borders.append(_el(f"w:{side}", **{"w:val": "single", "w:sz": max(2, int(round(bw * 8))),
@@ -400,7 +582,8 @@ def _write_table(doc, t: Table, margin_left: float, page_color) -> None:
     tblpr.append(borders)
     tblpr.append(_el("w:tblLayout", **{"w:type": "fixed"}))
     mar = _el("w:tblCellMar")
-    for side, v in (("top", 0), ("left", 40), ("bottom", 0), ("right", 40)):
+    for side, v in (("top", 0), ("left", int(CELL_MARGIN * TW)), ("bottom", 0),
+                    ("right", int(CELL_MARGIN * TW))):
         mar.append(_el(f"w:{side}", **{"w:w": v, "w:type": "dxa"}))
     tblpr.append(mar)
     grid = tbl.tblGrid
@@ -416,7 +599,10 @@ def _write_table(doc, t: Table, margin_left: float, page_color) -> None:
         tr = table.rows[r]._tr
         trpr = tr.get_or_add_trPr()
         # the renderer adds the border width to the row height
-        row_h = max(2.0, t.ys[r + 1] - t.ys[r] - bw)
+        row_h = t.ys[r + 1] - t.ys[r] - bw
+        if r == nr - 1:
+            row_h -= bw / 2      # the outer bottom border is drawn below the last row
+        row_h = max(2.0, row_h)
         trpr.append(_el("w:trHeight", **{"w:val": int(row_h * TW), "w:hRule": "atLeast"}))
         for lc in range(nc):
             vc = col_order[lc]
@@ -476,7 +662,7 @@ def _write_table(doc, t: Table, margin_left: float, page_color) -> None:
                 remaining = (y1c - top) - (ln.size * 1.0) * (len(lines) - i - 1)
                 L = min(L, max(ln.size * 0.9, remaining))
                 _para_props(par, rtl=ln.rtl, align=align, line=L)
-                _add_runs(par, ln.words)
+                _line_runs(par, ln.words, ln.rtl)
                 top += L
 
 
@@ -487,6 +673,7 @@ def build_docx(pages: list[DPage]) -> bytes:
     for p in list(body):
         if p.tag == qn("w:p"):
             body.remove(p)
+    ids = _Ids()
     for pi, page in enumerate(pages):
         section = doc.sections[0] if pi == 0 else doc.add_section(WD_SECTION.NEW_PAGE)
         tables = detect_tables(page)
@@ -524,7 +711,7 @@ def build_docx(pages: list[DPage]) -> bytes:
         section.header_distance = Emu(0)
         section.footer_distance = Emu(0)
 
-        bg, page_color = _background_png(page, tables)
+        page_color = page.page_color
         items = [("p", p.bbox[1], p) for p in group_paragraphs(free_lines)]
         items += [("t", t.bbox[1], t) for t in tables]
         items.sort(key=lambda it: it[1])
@@ -535,12 +722,13 @@ def build_docx(pages: list[DPage]) -> bytes:
             first_par = doc.add_paragraph()
         for kind, _y, obj in items:
             if kind == "t":
-                gap = obj.bbox[1] - cursor
+                # the outer top border is drawn above the first row
+                gap = obj.bbox[1] - cursor - _border(obj)[0] / 2
                 if gap > 1:
                     spacer = doc.add_paragraph()
                     _para_props(spacer, rtl=False, align=None, line=max(1.0, gap))
                     first_par = first_par or spacer
-                _write_table(doc, obj, margin_l, np.array(page_color))
+                _write_table(doc, obj, margin_l, page.width - margin_r, np.array(page_color))
                 cursor = obj.bbox[3]
                 continue
             p: Para = obj
@@ -559,6 +747,25 @@ def build_docx(pages: list[DPage]) -> bytes:
                 pitch = max(size, (p.lines[0].baseline - cursor) / 0.8)
                 line_top = p.lines[0].baseline - 0.8 * pitch
             before = line_top - cursor
+            if getattr(p, "tabbed", False):
+                ln = p.lines[0]
+                segs = segments(ln)
+
+                def start_of(sg):   # distance of a segment's start edge from the margin
+                    if ln.rtl:
+                        return col1 - max(w.bbox[2] for w in sg)
+                    return min(w.bbox[0] for w in sg) - col0
+
+                first = start_of(segs[0])
+                _para_props(par, rtl=ln.rtl, align=None, before=before, line=pitch,
+                            ind_start=first, ind_end=-min(4.0, 0.3 * size),
+                            tabs=[start_of(sg) for sg in segs[1:]])
+                for si, sg in enumerate(segs):
+                    if si:
+                        par.add_run("\t")
+                    _line_runs(par, sg, ln.rtl)
+                cursor = max(cursor, line_top) + pitch
+                continue
             jc, i_start, i_end = _alignment(p, col0, col1)
             # font metric differences must never cause extra line wraps: the
             # ragged side may run a little into the margin
@@ -572,15 +779,56 @@ def build_docx(pages: list[DPage]) -> bytes:
             _para_props(par, rtl=p.rtl, align=jc, before=before, line=pitch,
                         ind_start=i_start, ind_end=i_end)
             for li, ln in enumerate(p.lines):
-                if li:
-                    par.add_run(" ")
-                _add_runs(par, ln.words)
+                _line_runs(par, ln.words, p.rtl, leading=li > 0)
             cursor = max(cursor, line_top) + pitch * len(p.lines)
-        if bg is not None and first_par is not None:
-            _anchor_picture(first_par, bg, 0, 0, page.width, page.height, behind=True)
+        if first_par is not None and (page.rects or page.pictures
+                                      or not _near(page.page_color, (255, 255, 255), 3)):
+            _place_graphics(first_par, page, tables, ids)
+    _normalise_schema_order(doc.element.body)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+_ORDER = {
+    "pPr": ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl",
+            "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens",
+            "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN",
+            "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing",
+            "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment",
+            "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange"],
+    "rPr": ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike",
+            "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish",
+            "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight",
+            "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang",
+            "eastAsianLayout", "specVanish", "oMath"],
+    "tblPr": ["tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+              "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd", "tblBorders",
+              "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption", "tblDescription"],
+    "tcPr": ["cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap",
+             "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark"],
+    "trPr": ["cnfStyle", "divId", "gridBefore", "gridAfter", "wBefore", "wAfter", "cantSplit",
+             "trHeight", "tblHeader", "tblCellSpacing", "jc", "hidden"],
+}
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _normalise_schema_order(body) -> None:
+    """Word refuses files whose property elements are out of schema order or
+    duplicated (LibreOffice is lenient): sort them, keep the last duplicate."""
+    for name, order in _ORDER.items():
+        rank = {t: i for i, t in enumerate(order)}
+        for el in body.iter(_W + name):
+            kids = list(el)
+            seen: dict[str, object] = {}
+            for k in kids:
+                seen[k.tag] = k            # last one wins (ours come after defaults)
+            keep = [k for k in kids if seen.get(k.tag) is k]
+            keep.sort(key=lambda k: rank.get(k.tag.replace(_W, ""), len(order)))
+            for k in kids:
+                el.remove(k)
+            for k in keep:
+                el.append(k)
 
 
 def docx_has_rtl(data: bytes) -> bool:

@@ -213,51 +213,89 @@ def _match_fonts(page: OcrPage) -> None:
 
 
 # ------------------------------------------------------------------ geometry
+def _place(w: Word, r, s: float) -> None:
+    """Font size, baseline, horizontal scale and centre for scale s (px per ref px)."""
+    w.font_px = s * REF
+    ix0, iy0, ix1, iy1 = r.ink
+    w.baseline = w.bbox[3] - (iy1 - r.baseline_y) * s
+    raw = w.w / max(1.0, (ix1 - ix0) * s)
+    # the recognised text cannot plausibly produce this ink (misread / merged
+    # glyphs): the scan pixels stay visible and the text layer goes invisible
+    w.suspect = not 0.65 <= raw <= 1.5
+    w.scale_x = float(np.clip(raw, 0.5, 2.0))
+    off = ((ix0 + ix1) / 2 - (r.origin_x + r.advance / 2)) * s * w.scale_x
+    w.center_x = (w.bbox[0] + w.bbox[2]) / 2 - off
+
+
+def _width_fit(w: Word, r, s: float) -> float:
+    """|log| of the horizontal stretch needed at scale s (0 = perfect fit)."""
+    return abs(np.log(max(1e-3, w.w / max(1.0, (r.ink[2] - r.ink[0]) * s))))
+
+
 def _fit_geometry(page: OcrPage) -> None:
+    meas: dict[int, tuple] = {}
     for ln in page.lines:
-        meas = []
+        own = []
         for w in ln.words:
-            f = fonts.face(w.face_key, w.bold)
-            r = render(w.text, f, REF, w.rtl or ln.rtl)
+            r = render(w.text, fonts.face(w.face_key, w.bold), REF, w.rtl or ln.rtl)
             if r.ink is None:
-                meas.append(None)
                 continue
-            ink_h = r.ink[3] - r.ink[1]
-            meas.append((r, w.h / max(1, ink_h)))
-        scales = [m[1] for m in meas if m]
-        if not scales:
+            sc = w.h / max(1, r.ink[3] - r.ink[1])
+            meas[id(w)] = (r, sc)
+            own.append(sc)
+        if not own:
             continue
-        line_s = float(np.median(scales))
-        for w, m in zip(ln.words, meas):
-            if m is None:
+        line_s = float(np.median(own))
+        for w in ln.words:
+            if id(w) not in meas:
                 w.font_px = line_s * REF
                 w.baseline = w.bbox[3]
                 w.center_x = (w.bbox[0] + w.bbox[2]) / 2
                 continue
-            r, s = m
-            if abs(s - line_s) / line_s > 0.25:
-                s_use = s
-            else:
-                s_use = line_s
-            w.font_px = s_use * REF
-            ix0, iy0, ix1, iy1 = r.ink
-            desc = (iy1 - r.baseline_y) * s_use
-            w.baseline = w.bbox[3] - desc
-            ink_w = (ix1 - ix0) * s_use
-            raw = w.w / max(1.0, ink_w)
-            # the recognised text cannot plausibly produce this ink (misread / merged
-            # glyphs): the scan pixels stay visible and the text layer goes invisible
-            w.suspect = not 0.65 <= raw <= 1.5
-            w.scale_x = float(np.clip(raw, 0.5, 2.0))
-            off = ((ix0 + ix1) / 2 - (r.origin_x + r.advance / 2)) * s_use * w.scale_x
-            w.center_x = (w.bbox[0] + w.bbox[2]) / 2 - off
-        # snap words of the same line on one baseline when they nearly agree
-        same = [w for w in ln.words if abs(w.font_px - line_s * REF) < 1e-6]
-        if len(same) > 1:
-            med = float(np.median([w.baseline for w in same]))
-            for w in same:
-                if abs(w.baseline - med) < 0.08 * w.font_px:
-                    w.baseline = med
+            r, sc = meas[id(w)]
+            s_use = sc if abs(sc - line_s) / line_s > 0.25 else line_s
+            meas[id(w)] = (r, s_use)
+            _place(w, r, s_use)
+
+    # row consensus across the page (table rows, forms): words of one visual row
+    # with the same style share a size and a baseline.  A word whose glyph box is
+    # incomplete (dots outside the OCR box...) is snapped when that also fits its
+    # width better.
+    words = [w for w in page.words if id(w) in meas]
+    rows: list[list[Word]] = []
+    for w in sorted(words, key=lambda w: (w.bbox[1] + w.bbox[3]) / 2):
+        cy = (w.bbox[1] + w.bbox[3]) / 2
+        for row in rows:
+            ry0 = np.median([x.bbox[1] for x in row])
+            ry1 = np.median([x.bbox[3] for x in row])
+            if ry0 <= cy <= ry1:
+                row.append(w)
+                break
+        else:
+            rows.append([w])
+    for row in rows:
+        for w in row:
+            peers = [x for x in row if x is not w and x.bold == w.bold and x.face_key == w.face_key]
+            if len(peers) < 2:
+                continue
+            s_row = float(np.median([meas[id(x)][1] for x in peers]))
+            r, s_w = meas[id(w)]
+            if abs(s_w - s_row) / s_row > 0.12 and _width_fit(w, r, s_row) < _width_fit(w, r, s_w):
+                meas[id(w)] = (r, s_row)
+                _place(w, r, s_row)
+                base = float(np.median([x.baseline for x in peers]))
+                if abs(w.baseline - base) < 0.2 * w.font_px:
+                    w.baseline = base
+        # snap words of one row on one baseline when they nearly agree
+        groups: dict[int, list[Word]] = {}
+        for w in row:
+            groups.setdefault(int(round(w.font_px)), []).append(w)
+        for same in groups.values():
+            if len(same) > 1:
+                med = float(np.median([w.baseline for w in same]))
+                for w in same:
+                    if abs(w.baseline - med) < 0.08 * w.font_px:
+                        w.baseline = med
 
 
 def style_page(rgb: np.ndarray, page: OcrPage) -> OcrPage:

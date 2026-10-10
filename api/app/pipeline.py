@@ -105,9 +105,12 @@ class AnalysedPage:
 
 
 def analyse_page(pi: PageImage, langs: str, vectorize: bool = True,
-                 deskew: bool = False) -> AnalysedPage:
+                 deskew: bool | str = False) -> AnalysedPage:
     if deskew:
-        pi = PageImage(rotate_page(pi.rgb, estimate_skew(pi.rgb)), pi.dpi)
+        angle = estimate_skew(pi.rgb)
+        # "auto" (Word export): straighten only clearly tilted pages
+        if deskew is True or abs(angle) >= 0.3:
+            pi = PageImage(rotate_page(pi.rgb, angle), pi.dpi)
     page = ocr_image(pi.rgb, pi.dpi, langs)
     style_page(pi.rgb, page)
     gfx = analyse(pi.rgb, page, vectorize=vectorize)
@@ -115,7 +118,7 @@ def analyse_page(pi: PageImage, langs: str, vectorize: bool = True,
 
 
 async def analyse_all(pages: list[PageImage], langs: str, vectorize: bool = True,
-                      deskew: bool = False) -> list[AnalysedPage]:
+                      deskew: bool | str = False) -> list[AnalysedPage]:
     sem = asyncio.Semaphore(int(os.environ.get("OCR_WORKERS", "2")))
 
     async def one(p):
