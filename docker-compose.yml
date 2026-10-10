@@ -1,0 +1,33 @@
+services:
+  gotenberg:
+    build: ./gotenberg
+    image: lovepdf-gotenberg:latest
+    restart: unless-stopped
+    command:
+      - gotenberg
+      - --api-timeout=300s
+      - --chromium-auto-start=true
+      - --libreoffice-auto-start=true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    # expose for debugging only:
+    # ports: ["3000:3000"]
+
+  api:
+    build: ./api
+    image: lovepdf-api:latest
+    restart: unless-stopped
+    environment:
+      GOTENBERG_URL: http://gotenberg:3000
+      OCR_LANGS: ara+eng
+      OCR_WORKERS: "2"
+      MAX_UPLOAD_MB: "100"
+      MAX_PAGES: "50"
+    depends_on:
+      gotenberg:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
