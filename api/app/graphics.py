@@ -43,14 +43,12 @@ class Graphics:
     rects: list[Rect] = field(default_factory=list)
     crops: list[Crop] = field(default_factory=list)
     clean: np.ndarray | None = None   # inpainted page (suspect words kept as pixels)
-    clean_all: np.ndarray | None = None  # every recognised word removed (for Word export)
-    for_word: "Graphics | None" = None    # decomposition used by the Word writer
 
 
-def text_mask(page: OcrPage, include_suspect: bool = False) -> np.ndarray:
+def text_mask(page: OcrPage) -> np.ndarray:
     m = np.zeros((page.height, page.width), np.uint8)
     for w in page.words:
-        if w.mask is None or (w.suspect and not include_suspect):
+        if w.mask is None or w.suspect:
             continue
         x0, y0, x1, y1 = w.bbox
         m[y0:y1, x0:x1][w.mask[: y1 - y0, : x1 - x0]] = 255
@@ -58,8 +56,8 @@ def text_mask(page: OcrPage, include_suspect: bool = False) -> np.ndarray:
     return cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
 
 
-def erase_text(rgb: np.ndarray, page: OcrPage, include_suspect: bool = False) -> np.ndarray:
-    m = text_mask(page, include_suspect)
+def erase_text(rgb: np.ndarray, page: OcrPage) -> np.ndarray:
+    m = text_mask(page)
     if not m.any():
         return rgb.copy()
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -112,18 +110,8 @@ def analyse(rgb: np.ndarray, page: OcrPage, vectorize: bool = True) -> Graphics:
     clean = erase_text(rgb, page)
     page_color, _ = _dominant(clean[::4, ::4].reshape(-1, 3))
     g = Graphics(page_color=page_color, clean=clean)
-    suspects = any(w.suspect for w in page.words)
-    g.clean_all = erase_text(rgb, page, True) if suspects else clean
-    if not vectorize:
-        g.for_word = g
-        return g
-    _vectorize(g, clean, page)
-    if suspects:
-        # Word export writes suspect words as text, so they must not survive as pixels
-        g.for_word = Graphics(page_color=page_color, clean=g.clean_all, clean_all=g.clean_all)
-        _vectorize(g.for_word, g.clean_all, page)
-    else:
-        g.for_word = g
+    if vectorize:
+        _vectorize(g, clean, page)
     return g
 
 

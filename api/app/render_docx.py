@@ -358,8 +358,11 @@ class Para:
         return self.lines[0].rtl
 
 
-def group_paragraphs(lines: list[DLine]) -> list[Para]:
+def group_paragraphs(lines: list[DLine], col0: float, col1: float) -> list[Para]:
+    """Consecutive lines form one paragraph only where the text really wrapped:
+    the next line's first word would not have fitted at the end of the line above."""
     lines = sorted(lines, key=lambda ln: (ln.bbox[1], ln.bbox[0]))
+    width = col1 - col0
     paras: list[Para] = []
     for ln in lines:
         if len(segments(ln)) > 1:          # tab-positioned line: its own paragraph
@@ -376,20 +379,69 @@ def group_paragraphs(lines: list[DLine]) -> list[Para]:
             horiz = min(lb[2], cb[2]) - max(lb[0], cb[0]) > 0
             ok_pitch = len(p.lines) < 2 or abs(pitch - (lb[1] - p.lines[-2].bbox[1])) < 0.25 * pitch
             limit = (1.0 if ln.group == last.group else 0.75) * last.size
-            if same_style and horiz and -0.2 * last.size <= gap < limit and ok_pitch:
+            first = ln.words[0]
+            free = width - (lb[2] - lb[0])
+            wrapped = free < (first.bbox[2] - first.bbox[0]) + 0.6 * last.size
+            if same_style and horiz and -0.2 * last.size <= gap < limit and ok_pitch and wrapped:
                 p.lines.append(ln)
                 continue
         paras.append(Para([ln]))
     return paras
 
 
-def _alignment(p: Para, col0: float, col1: float) -> tuple[str | None, float, float]:
+def _stacks_and_bands(paras: list[Para]) -> list[tuple[str, float, object]]:
+    """Flow items: paragraphs, or 'bands' where blocks of text sit side by side
+    (letterhead columns, signature blocks...) - written as a borderless layout table
+    so each block keeps its own position instead of being stacked."""
+    stacks: list[list[Para]] = []
+    for p in sorted(paras, key=lambda p: p.bbox[1]):
+        x0, y0, x1, y1 = p.bbox
+        size = p.lines[0].size
+        for st in stacks:
+            sx0, _, sx1, _ = _union([q.bbox for q in st])
+            last = st[-1].bbox
+            ov = min(x1, sx1) - max(x0, sx0)
+            if ov > 0.3 * min(x1 - x0, sx1 - sx0) and 0 <= y0 - last[3] < 2.5 * size:
+                st.append(p)
+                break
+        else:
+            stacks.append([p])
+    bands: list[list[list[Para]]] = []
+    for st in sorted(stacks, key=lambda st: _union([q.bbox for q in st])[1]):
+        b = _union([q.bbox for q in st])
+        for band in bands:
+            bb = _union([q.bbox for s2 in band for q in s2])
+            if min(b[3], bb[3]) - max(b[1], bb[1]) > 0:
+                band.append(st)
+                break
+        else:
+            bands.append([st])
+    items: list[tuple[str, float, object]] = []
+    for band in bands:
+        boxes = sorted((_union([q.bbox for q in st]), i) for i, st in enumerate(band))
+        disjoint = all(boxes[i][0][2] <= boxes[i + 1][0][0] + 2 for i in range(len(boxes) - 1))
+        if len(band) > 1 and disjoint:
+            ordered = [band[i] for _, i in boxes]          # left to right
+            items.append(("b", min(b[1] for b, _ in boxes), ordered))
+        else:
+            for st in band:
+                for p in st:
+                    items.append(("p", p.bbox[1], p))
+    return items
+
+
+def _union(bs):
+    return (min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs))
+
+
+def _alignment(p: Para, col0: float, col1: float, tol: float | None = None) -> tuple[str | None, float, float]:
     """(jc, indent_start, indent_end) for a paragraph inside the column [col0, col1].
 
     NB: in a bidi paragraph Word / LibreOffice read jc="left" as start (= right)
     and jc="right" as end (= left); w:ind start / end are logical too.  The ragged
     side never gets an indent so the text can breathe like in the original."""
-    tol = max(4.0, 0.6 * p.lines[0].size)
+    if tol is None:
+        tol = max(4.0, 0.6 * p.lines[0].size)
     bbs = [ln.bbox for ln in p.lines]
     left_ok = [abs(b[0] - col0) < tol for b in bbs]
     right_ok = [abs(b[2] - col1) < tol for b in bbs]
@@ -429,7 +481,7 @@ def _anchor_picture(par, png: bytes, x_pt: float, y_pt: float, w_pt: float, h_pt
     inline = run._r.find(".//" + qn("wp:inline"))
     cx, cy = inline.find(qn("wp:extent")).get("cx"), inline.find(qn("wp:extent")).get("cy")
     anchor = _el("wp:anchor", distT=0, distB=0, distL=0, distR=0, simplePos=0, relativeHeight=z,
-                 behindDoc=1 if behind else 0, locked=0, layoutInCell=1, allowOverlap=1)
+                 behindDoc=1 if behind else 0, locked=0, layoutInCell=0, allowOverlap=1)
     anchor.append(_el("wp:simplePos", x=0, y=0))
     ph = _el("wp:positionH", relativeFrom="page")
     po = OxmlElement("wp:posOffset")
@@ -453,7 +505,7 @@ def _anchor_picture(par, png: bytes, x_pt: float, y_pt: float, w_pt: float, h_pt
 
 _SHAPE = (
     '<w:drawing {ns}><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" '
-    'relativeHeight="{z}" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">'
+    'relativeHeight="{z}" behindDoc="1" locked="0" layoutInCell="0" allowOverlap="1">'
     '<wp:simplePos x="0" y="0"/>'
     '<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>'
     '<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
@@ -667,6 +719,97 @@ def _write_table(doc, t: Table, margin_left: float, margin_right_edge: float, pa
 
 
 # =============================================================== document
+def _write_para(par, p: Para, cursor: float, col0: float, col1: float,
+                snap: float | None = None) -> float:
+    """Write paragraph p into the (empty) paragraph `par` so its first baseline lands
+    where it was, inside the column [col0, col1]. Returns the new vertical cursor."""
+    size = float(np.median([ln.size for ln in p.lines]))
+    if len(p.lines) > 1:
+        pitch = float(np.median([b.bbox[1] - a.bbox[1] for a, b in zip(p.lines, p.lines[1:])]))
+    else:
+        pitch = max(size * 1.25, p.lines[0].bbox[3] - p.lines[0].bbox[1])
+    # exact line spacing L puts the baseline at line_top + 0.8 L (Word and
+    # LibreOffice agree), so the first baseline lands where it was
+    line_top = p.lines[0].baseline - 0.8 * pitch
+    if line_top < cursor and len(p.lines) == 1:
+        # tight under the previous block: a smaller exact line keeps the baseline
+        pitch = max(size, (p.lines[0].baseline - cursor) / 0.8)
+        line_top = p.lines[0].baseline - 0.8 * pitch
+    before = line_top - cursor
+    if getattr(p, "tabbed", False):
+        ln = p.lines[0]
+        segs = segments(ln)
+
+        def start_of(sg):   # distance of a segment's start edge from the margin
+            if ln.rtl:
+                return col1 - max(w.bbox[2] for w in sg)
+            return min(w.bbox[0] for w in sg) - col0
+
+        _para_props(par, rtl=ln.rtl, align=None, before=before, line=pitch,
+                    ind_start=start_of(segs[0]), ind_end=-min(4.0, 0.3 * size),
+                    tabs=[start_of(sg) for sg in segs[1:]])
+        for si, sg in enumerate(segs):
+            if si:
+                par.add_run("\t")
+            _line_runs(par, sg, ln.rtl)
+        return max(cursor, line_top) + pitch
+    jc, i_start, i_end = _alignment(p, col0, col1, snap)
+    # font metric differences must never cause extra line wraps: the ragged side
+    # may run a little into the margin (default jc: aligned on the start side,
+    # ragged end; jc="right" is the end side in both directions, ragged start)
+    slack = min(4.0, 0.3 * size)
+    if jc is None and i_end == 0:
+        i_end = -slack
+    elif jc == "right" and i_start == 0:
+        i_start = -slack
+    _para_props(par, rtl=p.rtl, align=jc, before=before, line=pitch,
+                ind_start=i_start, ind_end=i_end)
+    for li, ln in enumerate(p.lines):
+        _line_runs(par, ln.words, p.rtl, leading=li > 0)
+    return max(cursor, line_top) + pitch * len(p.lines)
+
+
+def _write_band(doc, stacks: list[list[Para]], cursor: float, col0: float, col1: float) -> float:
+    """Side-by-side blocks as a one-row borderless table spanning the text column;
+    every block is written in its own cell with the same exact positioning."""
+    boxes = [_union([q.bbox for q in st]) for st in stacks]
+    bounds = [col0] + [(boxes[i][2] + boxes[i + 1][0]) / 2 for i in range(len(boxes) - 1)] + [col1]
+    table = doc.add_table(rows=1, cols=len(stacks))
+    tbl = table._tbl
+    tblpr = tbl.tblPr
+    for e in list(tblpr):
+        if e.tag == qn("w:tblStyle"):
+            tblpr.remove(e)
+    tblpr.append(_el("w:tblW", **{"w:w": int((col1 - col0) * TW), "w:type": "dxa"}))
+    tblpr.append(_el("w:tblInd", **{"w:w": 0, "w:type": "dxa"}))
+    borders = _el("w:tblBorders")
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        borders.append(_el(f"w:{side}", **{"w:val": "nil"}))
+    tblpr.append(borders)
+    tblpr.append(_el("w:tblLayout", **{"w:type": "fixed"}))
+    mar = _el("w:tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        mar.append(_el(f"w:{side}", **{"w:w": 0, "w:type": "dxa"}))
+    tblpr.append(mar)
+    grid = tbl.tblGrid
+    for gc in list(grid):
+        grid.remove(gc)
+    for i in range(len(stacks)):
+        grid.append(_el("w:gridCol", **{"w:w": int((bounds[i + 1] - bounds[i]) * TW)}))
+    end = cursor
+    for i, st in enumerate(stacks):
+        cell = table.cell(0, i)
+        tcpr = cell._tc.get_or_add_tcPr()
+        tcpr.append(_el("w:tcW", **{"w:w": int((bounds[i + 1] - bounds[i]) * TW), "w:type": "dxa"}))
+        c = cursor
+        for j, p in enumerate(sorted(st, key=lambda q: q.bbox[1])):
+            par = cell.paragraphs[0] if j == 0 else cell.add_paragraph()
+            # cell edges are arbitrary (mid-gap): position exactly, never snap to them
+            c = _write_para(par, p, c, bounds[i], bounds[i + 1], snap=0.5)
+        end = max(end, c)
+    return end
+
+
 def build_docx(pages: list[DPage]) -> bytes:
     doc = Document()
     body = doc.element.body
@@ -712,7 +855,7 @@ def build_docx(pages: list[DPage]) -> bytes:
         section.footer_distance = Emu(0)
 
         page_color = page.page_color
-        items = [("p", p.bbox[1], p) for p in group_paragraphs(free_lines)]
+        items = _stacks_and_bands(group_paragraphs(free_lines, col0, col1))
         items += [("t", t.bbox[1], t) for t in tables]
         items.sort(key=lambda it: it[1])
 
@@ -731,56 +874,15 @@ def build_docx(pages: list[DPage]) -> bytes:
                 _write_table(doc, obj, margin_l, page.width - margin_r, np.array(page_color))
                 cursor = obj.bbox[3]
                 continue
-            p: Para = obj
+            if kind == "b":
+                cursor = _write_band(doc, obj, cursor, col0, col1)
+                continue
             par = doc.add_paragraph()
             first_par = first_par or par
-            size = float(np.median([ln.size for ln in p.lines]))
-            if len(p.lines) > 1:
-                pitch = float(np.median([b.bbox[1] - a.bbox[1] for a, b in zip(p.lines, p.lines[1:])]))
-            else:
-                pitch = max(size * 1.25, p.lines[0].bbox[3] - p.lines[0].bbox[1])
-            # exact line spacing L puts the baseline at line_top + 0.8 L (Word and
-            # LibreOffice agree), so the first baseline lands where it was
-            line_top = p.lines[0].baseline - 0.8 * pitch
-            if line_top < cursor and len(p.lines) == 1:
-                # tight under the previous block: a smaller exact line keeps the baseline
-                pitch = max(size, (p.lines[0].baseline - cursor) / 0.8)
-                line_top = p.lines[0].baseline - 0.8 * pitch
-            before = line_top - cursor
-            if getattr(p, "tabbed", False):
-                ln = p.lines[0]
-                segs = segments(ln)
-
-                def start_of(sg):   # distance of a segment's start edge from the margin
-                    if ln.rtl:
-                        return col1 - max(w.bbox[2] for w in sg)
-                    return min(w.bbox[0] for w in sg) - col0
-
-                first = start_of(segs[0])
-                _para_props(par, rtl=ln.rtl, align=None, before=before, line=pitch,
-                            ind_start=first, ind_end=-min(4.0, 0.3 * size),
-                            tabs=[start_of(sg) for sg in segs[1:]])
-                for si, sg in enumerate(segs):
-                    if si:
-                        par.add_run("\t")
-                    _line_runs(par, sg, ln.rtl)
-                cursor = max(cursor, line_top) + pitch
-                continue
-            jc, i_start, i_end = _alignment(p, col0, col1)
-            # font metric differences must never cause extra line wraps: the
-            # ragged side may run a little into the margin
-            # (default jc: aligned on the start side, ragged end; jc="right" is the
-            # end side in both directions, ragged start)
-            slack = min(4.0, 0.3 * size)
-            if jc is None and i_end == 0:
-                i_end = -slack
-            elif jc == "right" and i_start == 0:
-                i_start = -slack
-            _para_props(par, rtl=p.rtl, align=jc, before=before, line=pitch,
-                        ind_start=i_start, ind_end=i_end)
-            for li, ln in enumerate(p.lines):
-                _line_runs(par, ln.words, p.rtl, leading=li > 0)
-            cursor = max(cursor, line_top) + pitch * len(p.lines)
+            cursor = _write_para(par, obj, cursor, col0, col1)
+        if first_par is None and (page.rects or page.pictures):
+            first_par = doc.add_paragraph()      # anchor holder (graphics are page-positioned)
+            _para_props(first_par, rtl=False, align=None, line=1.0)
         if first_par is not None and (page.rects or page.pictures
                                       or not _near(page.page_color, (255, 255, 255), 3)):
             _place_graphics(first_par, page, tables, ids)

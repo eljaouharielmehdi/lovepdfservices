@@ -39,6 +39,8 @@ class Word:
     scale_x: float = 1.0
     center_x: float = 0.0
     suspect: bool = False   # text does not fit its ink: keep original pixels visible
+    match: float = 0.0      # best overlap (IoU) between rendered glyphs and the scanned ink
+    disputed: bool = False  # two independent readings disagree (see _arabic_second_reading)
     mask: np.ndarray | None = field(default=None, repr=False)
 
     @property
@@ -284,6 +286,69 @@ def _latin_second_opinion(gray: np.ndarray, lines: list[Line], langs: str, dpi: 
                       max(w.bbox[2], a.bbox[2]), max(w.bbox[3], a.bbox[3]))
 
 
+def _arabic_second_reading(gray: np.ndarray, lines: list[Line], dpi: int) -> None:
+    """Small Arabic text has too few pixels for the dots that tell letters apart
+    (ت / ث, ع / غ, ي / ئ ...). Every Arabic line is read again, enlarged and with
+    the Arabic model alone, in one Tesseract call (lines stacked in one image).
+    The more confident reading wins; when the readings disagree and neither is
+    very confident the word is marked `disputed` (its scan pixels will be kept)."""
+    targets = [ln for ln in lines if any(has_arabic(w.text) for w in ln.words)]
+    if not targets:
+        return
+    H, W = gray.shape[:2]
+    crops, slots, y = [], [], 0
+    for ln in targets:
+        x0, y0, x1, y1 = ln.bbox
+        h = max(1, y1 - y0)
+        pad = int(0.35 * h) + 4
+        X0, Y0, X1, Y1 = max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad)
+        sc = float(np.clip(90.0 / h, 1.0, 3.0))
+        c = cv2.resize(gray[Y0:Y1, X0:X1], None, fx=sc, fy=sc, interpolation=cv2.INTER_CUBIC)
+        crops.append(c)
+        slots.append((ln, X0, Y0, sc, y, y + c.shape[0]))
+        y += c.shape[0] + 60
+    width = max(c.shape[1] for c in crops) + 40
+    canvas = np.full((y + 40, width), 255, np.uint8)
+    for c, (_, _, _, _, top, _) in zip(crops, slots):
+        canvas[top + 20:top + 20 + c.shape[0], 20:20 + c.shape[1]] = c
+    try:
+        reread = [w for ln in parse_hocr(run_tesseract(canvas, "ara", 6, int(dpi * 2)))
+                  for w in ln.words]
+    except RuntimeError:
+        return
+    for ln, X0, Y0, sc, top, bottom in slots:
+        mine = []
+        for w in reread:
+            cy = (w.bbox[1] + w.bbox[3]) / 2 - 20
+            if top <= cy <= bottom:
+                bx = ((w.bbox[0] - 20) / sc + X0, (w.bbox[1] - 20 - top) / sc + Y0,
+                      (w.bbox[2] - 20) / sc + X0, (w.bbox[3] - 20 - top) / sc + Y0)
+                mine.append((bx, w))
+        for w in ln.words:
+            # Arabic words, and numbers inside Arabic text (the Arabic comma is
+            # easily read as a digit: "16،" -> "616")
+            if not has_arabic(w.text) and not any(c.isdigit() for c in w.text):
+                continue
+            best, best_ov = None, 0.0
+            for bx, r in mine:
+                ix = max(0.0, min(bx[2], w.bbox[2]) - max(bx[0], w.bbox[0]))
+                iy = max(0.0, min(bx[3], w.bbox[3]) - max(bx[1], w.bbox[1]))
+                # the two boxes must correspond (overlap both ways), not merely touch
+                area_r = max(1.0, (bx[2] - bx[0]) * (bx[3] - bx[1]))
+                ov = min(ix * iy / max(1.0, w.w * w.h), ix * iy / area_r)
+                if ov > best_ov:
+                    best, best_ov = r, ov
+            if best is None or best_ov < 0.5:
+                continue
+            alt = normalize_ocr_text(best.text)
+            if alt == w.text or not alt:
+                continue
+            if best.conf >= w.conf + 3 and has_arabic(w.text) == has_arabic(alt):
+                w.text, w.conf = alt, best.conf
+            if max(best.conf, w.conf) < 93:
+                w.disputed = True
+
+
 def _group_sparse(words: list[Word], par_offset: int) -> list[Line]:
     """Group single words from the sparse pass into lines by vertical overlap."""
     lines: list[Line] = []
@@ -304,6 +369,8 @@ def ocr_image(rgb: np.ndarray, dpi: float, langs: str = DEFAULT_LANGS,
         ln.words = [x for x in ln.words if _plausible(x, min_conf) and not _too_big(x, median_h)]
     lines = [ln for ln in lines if ln.words]
     _latin_second_opinion(gray, lines, langs, idpi)
+    if "ara" in langs.split("+"):
+        _arabic_second_reading(gray, lines, idpi)
 
     # second pass: sparse text on what is left (single digits in table cells...)
     masked = gray.copy()

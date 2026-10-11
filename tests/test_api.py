@@ -406,4 +406,6 @@ def test_ocr_to_word_phone_capture(api, out_dir):
     t = d.tables[0]
     assert [c.text for c in t.rows[0].cells] == ["المنتج", "الكمية", "السعر"]
     text = docx_text(r.content)
-    assert "المجموع الكلي: 19750 درهم" in text
+    # on this degraded photo a word that cannot be regenerated faithfully (here the
+    # currency word) keeps its scan pixels instead of becoming text
+    assert "المجموع الكلي: 19750" in text

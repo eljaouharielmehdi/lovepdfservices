@@ -210,9 +210,15 @@ the original on the left and the regenerated output on the right:
 
 ## Known limits
 
-* OCR accuracy is Tesseract's. A word whose recognised text cannot produce its ink (a misread)
-  keeps its original pixels visible, with the text layer invisible on top, so the page still
-  looks exact. Words below `OCR_MIN_CONF` stay as pixels too.
+* OCR accuracy is Tesseract's. Every recognised word is redrawn exactly as it will appear
+  (font, size, baseline, width) and compared with the scan. A word that would not look the
+  same keeps its **original pixels**. That covers misreads, signatures, stamps, logos, bullets,
+  scripts without an OCR model such as Tifinagh, and Arabic words that two independent readings
+  disagree on. In the PDF its text goes to the invisible text layer. In Word it stays a
+  picture, so the page always looks like the original. Words below `OCR_MIN_CONF` stay pixels
+  too.
+* Bold is detected relative to the page itself, because scans (CamScanner, faxes, toner)
+  thicken all strokes.
 * Fonts are matched against the bundled free families. A document set in another typeface is
   regenerated with the closest one, at the same size, weight, color and position.
 * Handwriting is kept as image crops, not recognised.

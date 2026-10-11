@@ -357,7 +357,7 @@ def from_ocr(ap: AnalysedPage) -> DPage:
     for ln in ap.ocr.lines:
         ws = []
         for w in ln.words:
-            if not w.face_key:
+            if not w.face_key or w.suspect:   # kept as original pixels
                 continue
             f = fonts.face(w.face_key, w.bold)
             x0, y0, x1, y1 = w.bbox
@@ -370,7 +370,7 @@ def from_ocr(ap: AnalysedPage) -> DPage:
         ln.words = logical_order(ln.words, ln.rtl)
         for w in ln.words:
             settle_font(w)
-    g = ap.gfx.for_word or ap.gfx
+    g = ap.gfx
     dp.page_color = tuple(int(c) for c in g.page_color)  # type: ignore[assignment]
     for r in g.rects:
         dp.rects.append(DRule(r.x * k, r.y * k, r.w * k, r.h * k, r.color))
